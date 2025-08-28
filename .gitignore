@@ -1,0 +1,24 @@
+# Node / React defaults
+node_modules/
+dist/
+.vite/
+.parcel-cache/
+.cache/
+
+# Env and logs
+.env*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Coverage and temp
+coverage/
+*.local
+*.tmp
