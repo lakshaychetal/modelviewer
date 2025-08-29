@@ -6,6 +6,7 @@ import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js'
 import { mergeVertices } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { processTexture } from '../utils/textureUtils'
+import earcut from 'earcut'
 import { CSG } from 'three-csg-ts'
 
 export default function ModelViewer({ fileUrl, fileName, controls, onError, cropEnabled=false, crop, onCropBounds, rotation, pairedRotation=true, applyCropToken, onApplyStart, onApplied, onBounds, sizeRequest, onAppliedSize, applySizeToken }) {
@@ -293,7 +294,7 @@ export default function ModelViewer({ fileUrl, fileName, controls, onError, crop
     if (size.x <= 0 || size.y <= 0 || size.z <= 0) return
     const center = new THREE.Vector3((crop.minX + crop.maxX) / 2, (crop.minY + crop.maxY) / 2, (crop.minZ + crop.maxZ) / 2)
     // small expansion to avoid coplanar surface issues during CSG
-    const eps = Math.max(size.x, size.y, size.z) * 1e-5
+  const eps = Math.max(size.x, size.y, size.z) * 1e-4
     const boxGeo = new THREE.BoxGeometry(size.x + eps, size.y + eps, size.z + eps)
     const boxMat = new THREE.MeshBasicMaterial({ color: 0xffffff })
     const boxMesh = new THREE.Mesh(boxGeo, boxMat)
@@ -307,55 +308,29 @@ export default function ModelViewer({ fileUrl, fileName, controls, onError, crop
 
     sceneObject.updateMatrixWorld(true)
 
+    const enableCSG = false // disable unstable CSG for now; use robust clipper
     sceneObject.traverse((child) => {
       if (!child.isMesh || !child.geometry) return
+      // Skip skinned meshes for now
       if (child.isSkinnedMesh) return
       try {
-        // Preferred: robust CSG intersection with the oriented crop box to produce smooth, capped cuts
-        // Build world-space meshes with baked transforms for stable CSG
-        const aGeoWorld = child.geometry.clone()
-        aGeoWorld.applyMatrix4(child.matrixWorld)
-        const aMeshWorld = new THREE.Mesh(aGeoWorld, new THREE.MeshBasicMaterial())
-        const bGeoWorld = boxMesh.geometry.clone()
-        bGeoWorld.applyMatrix4(boxMesh.matrixWorld)
-        const bMeshWorld = new THREE.Mesh(bGeoWorld, new THREE.MeshBasicMaterial())
-
-        let resultMesh = null
-        try {
-          resultMesh = CSG.intersect(aMeshWorld, bMeshWorld)
-        } catch (e) {
-          // Some geometries can fail CSG; fall back to custom clipper below
-          resultMesh = null
+        if (enableCSG) {
+          // CSG path currently disabled; kept for future use
         }
-
-        if (resultMesh && resultMesh.geometry && resultMesh.geometry.attributes?.position?.count > 0) {
-          // Transform result geometry back into child's local space
-          const invChildWorld = new THREE.Matrix4().copy(child.matrixWorld).invert()
-          const resLocal = resultMesh.geometry.clone()
-          resLocal.applyMatrix4(invChildWorld)
-          let cleaned = resLocal
+        // Robust fallback: polygon clipper (keeps original surfaces inside the box)
+        const invBox = new THREE.Matrix4().copy(boxMesh.matrixWorld).invert()
+        const half = new THREE.Vector3(size.x * 0.5 + eps, size.y * 0.5 + eps, size.z * 0.5 + eps)
+        const newGeom = clipMeshKeepInside(child, invBox, half)
+        if (newGeom) {
+          let cleaned = newGeom
           try { cleaned = mergeVertices(cleaned, 1e-5) } catch {}
-          cleaned.computeVertexNormals()
+          try { cleaned.computeVertexNormals() } catch {}
           cleaned.computeBoundingBox(); cleaned.computeBoundingSphere()
           child.geometry.dispose?.()
           child.geometry = cleaned
           child.visible = true
         } else {
-          // Fallback: use existing polygon clipper to keep inside region
-          const invBox = new THREE.Matrix4().copy(boxMesh.matrixWorld).invert()
-          const half = new THREE.Vector3(size.x * 0.5 + eps, size.y * 0.5 + eps, size.z * 0.5 + eps)
-          const newGeom = clipMeshKeepInside(child, invBox, half)
-          if (newGeom) {
-            let cleaned = newGeom
-            try { cleaned = mergeVertices(cleaned, 1e-5) } catch {}
-            cleaned.computeVertexNormals()
-            cleaned.computeBoundingBox(); cleaned.computeBoundingSphere()
-            child.geometry.dispose?.()
-            child.geometry = cleaned
-            child.visible = true
-          } else {
-            child.visible = false
-          }
+          child.visible = false
         }
       } catch (e) {
         console.warn('Crop failed', e)
@@ -448,7 +423,8 @@ export default function ModelViewer({ fileUrl, fileName, controls, onError, crop
     // Clip polygon by one plane using Sutherland–Hodgman
     const clipByPlane = (poly, plane) => {
       const res = []
-      if (poly.length === 0) return res
+      const inters = []
+      if (poly.length === 0) return { poly: res, inters }
       const getCoord = (p) => plane.axis === 'x' ? p.pb.x : plane.axis === 'y' ? p.pb.y : p.pb.z
       const limit = plane.limit
       const s = plane.s
@@ -462,19 +438,25 @@ export default function ModelViewer({ fileUrl, fileName, controls, onError, crop
           res.push(cur)
         } else if (prevIn && !curIn) {
           // leaving -> add intersection
-          res.push(intersect(prev, cur, plane.axis, limit))
+          const ip = intersect(prev, cur, plane)
+          inters.push(ip)
+          res.push(ip)
         } else if (!prevIn && curIn) {
           // entering -> add intersection then current
-          res.push(intersect(prev, cur, plane.axis, limit))
+          const ip = intersect(prev, cur, plane)
+          inters.push(ip)
+          res.push(ip)
           res.push(cur)
         }
         // else both out: add nothing
       }
-      return res
+      return { poly: res, inters }
     }
 
     // Intersect segment AB with plane axis=const
-    const intersect = (A, B, axis, limit) => {
+    const intersect = (A, B, plane) => {
+      const axis = plane.axis
+      const limitSigned = plane.s > 0 ? plane.limit : -plane.limit
       const a = A.pb[axis]
       const b = B.pb[axis]
       const denom = (b - a)
@@ -483,7 +465,7 @@ export default function ModelViewer({ fileUrl, fileName, controls, onError, crop
         // Segment nearly parallel to plane; choose midpoint to avoid spikes
         t = 0.5
       } else {
-        t = (limit - a) / denom
+        t = (limitSigned - a) / denom
       }
       // clamp
       if (!Number.isFinite(t)) t = 0.5
@@ -497,6 +479,10 @@ export default function ModelViewer({ fileUrl, fileName, controls, onError, crop
       return v
     }
 
+    const planeKey = (pl) => `${pl.axis}${pl.s > 0 ? '+' : '-'}`
+    const capSegments = new Map() // key -> Array<[v1,v2]>
+    for (const pl of planes) capSegments.set(planeKey(pl), [])
+
     for (let i = 0; i < pos.count; i += 3) {
       let poly = [makeV(i), makeV(i+1), makeV(i+2)]
       // Quick reject if completely outside any axis range
@@ -507,7 +493,15 @@ export default function ModelViewer({ fileUrl, fileName, controls, onError, crop
       }
       if (!allInside) {
         for (const plane of planes) {
-          poly = clipByPlane(poly, plane)
+          const r = clipByPlane(poly, plane)
+          poly = r.poly
+          if (r.inters && r.inters.length >= 2) {
+            const list = capSegments.get(planeKey(plane))
+            // triangles against a single plane will produce at most 2 intersections
+            for (let m = 0; m + 1 < r.inters.length; m += 2) {
+              list.push([r.inters[m], r.inters[m+1]])
+            }
+          }
           if (poly.length === 0) break
         }
       }
@@ -532,6 +526,101 @@ export default function ModelViewer({ fileUrl, fileName, controls, onError, crop
         outPos.push(p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z)
         if (hasUV) {
           outUV.push(v0.uv.x, v0.uv.y, v1.uv.x, v1.uv.y, v2.uv.x, v2.uv.y)
+        }
+      }
+    }
+
+    // Build cap faces for each plane from collected segments
+    const keyForPoint = (v, axis) => {
+      const p = v.pb
+      // hash using the two varying coordinates for this plane
+      const round = (x) => Math.round(x * 1e6) / 1e6
+      if (axis === 'x') return `${round(p.y)},${round(p.z)}`
+      if (axis === 'y') return `${round(p.x)},${round(p.z)}`
+      return `${round(p.x)},${round(p.y)}`
+    }
+
+    const buildLoops = (segs, axis) => {
+      const loops = []
+      const used = new Set()
+      // index segments by start key and end key
+      const startMap = new Map()
+      const endMap = new Map()
+      const pushMap = (map, key, idx) => {
+        if (!map.has(key)) map.set(key, [])
+        map.get(key).push(idx)
+      }
+      for (let i = 0; i < segs.length; i++) {
+        const [a, b] = segs[i]
+        pushMap(startMap, keyForPoint(a, axis), i)
+        pushMap(endMap, keyForPoint(b, axis), i)
+      }
+      for (let i = 0; i < segs.length; i++) {
+        if (used.has(i)) continue
+        let [a, b] = segs[i]
+        used.add(i)
+        const loop = [a, b]
+        let closed = false
+        while (true) {
+          const curKey = keyForPoint(loop[loop.length - 1], axis)
+          const candidates = startMap.get(curKey) || []
+          let found = -1
+          for (const idx of candidates) { if (!used.has(idx)) { found = idx; break } }
+          if (found === -1) break
+          used.add(found)
+          const seg = segs[found]
+          const nextStart = keyForPoint(seg[0], axis)
+          const nextEnd = keyForPoint(seg[1], axis)
+          if (nextStart === curKey) {
+            loop.push(seg[1])
+          } else if (nextEnd === curKey) {
+            loop.push(seg[0])
+          } else {
+            break
+          }
+          if (keyForPoint(loop[0], axis) === keyForPoint(loop[loop.length - 1], axis)) { closed = true; break }
+        }
+        if (closed && loop.length >= 4) { // at least a triangle plus closing point equality
+          // drop last duplicate point if identical to first
+          if (keyForPoint(loop[0], axis) === keyForPoint(loop[loop.length - 1], axis)) loop.pop()
+          loops.push(loop)
+        }
+      }
+      return loops
+    }
+
+    for (const pl of planes) {
+      const segs = capSegments.get(planeKey(pl))
+      if (!segs || segs.length === 0) continue
+      const loops = buildLoops(segs, pl.axis)
+      for (const loop of loops) {
+        if (loop.length < 3) continue
+        // Project loop to 2D in box-local space for triangulation
+        const coords = []
+        for (const v of loop) {
+          const p = v.pb
+          if (pl.axis === 'x') coords.push(p.y, p.z)
+          else if (pl.axis === 'y') coords.push(p.x, p.z)
+          else coords.push(p.x, p.y)
+        }
+        let indices = []
+        try { indices = earcut(coords) } catch { indices = [] }
+        if (indices.length < 3) continue
+        for (let t = 0; t < indices.length; t += 3) {
+          const a = loop[indices[t]]
+          const b = loop[indices[t+1]]
+          const c = loop[indices[t+2]]
+          const p0 = a.pw.clone().applyMatrix4(worldToLocal)
+          const p1 = b.pw.clone().applyMatrix4(worldToLocal)
+          const p2 = c.pw.clone().applyMatrix4(worldToLocal)
+          outPos.push(p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z)
+          if (hasUV) {
+            // Use interpolated UVs from intersection points if available; else zeros
+            const uv0 = a.uv || new THREE.Vector2(0,0)
+            const uv1 = b.uv || new THREE.Vector2(0,0)
+            const uv2 = c.uv || new THREE.Vector2(0,0)
+            outUV.push(uv0.x, uv0.y, uv1.x, uv1.y, uv2.x, uv2.y)
+          }
         }
       }
     }
@@ -652,9 +741,8 @@ export default function ModelViewer({ fileUrl, fileName, controls, onError, crop
           ctx.drawImage(img, 0, 0, w, h)
           const oldImage = map.image
           const restore = () => { map.image = oldImage }
-          // Hint exporter to use JPEG when alpha not needed by forcing RGB format and overriding toDataURL
+          // Hint exporter to use JPEG when alpha not needed by overriding toDataURL
           if (!needsAlpha) {
-            try { map.format = THREE.RGBFormat } catch {}
             const origToDataURL = canvas.toDataURL?.bind(canvas)
             // Prefer JPEG at provided quality; exporter will call canvas.toDataURL(mime)
             if (origToDataURL) {
